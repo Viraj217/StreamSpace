@@ -10,7 +10,7 @@ import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-const String serverHost = '192.168.1.100';
+const String serverHost = '192.168.31.6';
 const int serverPort = 8080;
 const String baseUrl = 'http://$serverHost:$serverPort';
 const String wsUrl = 'ws://$serverHost:$serverPort/ws';
