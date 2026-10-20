@@ -200,8 +200,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         .getInitialMedia()
         .then((List<SharedMediaFile> files) {
       if (files.isNotEmpty) {
-        _handleSharedMedia(files);
-        ReceiveSharingIntent.instance.reset();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _handleSharedMedia(files);
+            ReceiveSharingIntent.instance.reset();
+          }
+        });
       }
     });
   }
@@ -227,6 +231,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _showSpacePickerSheet(Function(String space) onPick) {
+    if (!mounted) return;
     showModalBottomSheet(
       context: context,
       backgroundColor: kBgSurface,
