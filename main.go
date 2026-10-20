@@ -431,10 +431,33 @@ func handleServeFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing path", http.StatusBadRequest)
 		return
 	}
-	fp = strings.ReplaceAll(fp, "..", "")
+	fp = filepath.Clean(strings.ReplaceAll(fp, "..", ""))
+	uploadsAbs, err := filepath.Abs("data/uploads")
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	fileAbs, err := filepath.Abs(fp)
+	if err != nil || (!strings.HasPrefix(fileAbs, uploadsAbs) && !strings.HasPrefix(strings.ToLower(fileAbs), strings.ToLower(uploadsAbs))) {
+		http.Error(w, "invalid path", http.StatusForbidden)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		name = filepath.Base(fp)
+	}
+	name = strings.ReplaceAll(name, `"`, "")
+
 	mt := mime.TypeByExtension(filepath.Ext(fp))
-	if mt != "" {
-		w.Header().Set("Content-Type", mt)
+	if mt == "" {
+		mt = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", mt)
+	if r.URL.Query().Get("download") == "1" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+	} else {
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, name))
 	}
 	http.ServeFile(w, r, fp)
 }
@@ -653,6 +676,9 @@ tailwind.config = {
   .chip.active { background: #7c3aed; color: white; box-shadow: 0 0 12px rgba(139, 92, 246, 0.4); }
   .toast { position: fixed; bottom: 80px; right: 24px; z-index: 9999; padding: 12px 20px; border-radius: 12px; font-size: 0.85rem; font-weight: 500; opacity: 0; transform: translateY(12px); transition: all 0.3s ease; pointer-events: none; }
   .toast.show { opacity: 1; transform: translateY(0); }
+  .line-clamp { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+  .show-more-btn { color: #a78bfa; font-size: 0.8rem; font-weight: 600; margin-top: 6px; background: none; border: none; cursor: pointer; padding: 0; }
+  .show-more-btn:hover { color: #c4b5fd; }
 </style>
 </head>
 <body class="bg-surface-950 text-gray-100 min-h-screen flex overflow-hidden">
@@ -856,20 +882,20 @@ tailwind.config = {
       var typeIcon = TYPE_ICONS[b.block_type] || TYPE_ICONS.text;
       var preview = '';
       if (b.block_type === 'image' && b.file_path) {
-        preview = '<div class="mt-3 rounded-lg overflow-hidden border border-white/5"><img src="/api/file?path=' + encodeURIComponent(b.file_path) + '" alt="' + escapeHtml(b.file_name) + '" class="w-full h-40 object-cover" onerror="this.parentNode.style.display=\'none\'"></div>';
+        preview = '<div class="mt-3 rounded-lg overflow-hidden border border-white/5 cursor-pointer" onclick="window.openBlock(' + b.id + ')"><img src="' + fileUrl(b, false) + '" alt="' + escapeHtml(b.file_name) + '" class="w-full h-40 object-cover" onerror="this.parentNode.style.display=\'none\'"></div>';
       } else if (b.block_type === 'link') {
         preview = '<a href="' + escapeHtml(b.raw_content) + '" target="_blank" rel="noopener" class="mt-3 block text-sm text-blue-400 hover:text-blue-300 truncate transition-colors">' + escapeHtml(b.raw_content) + '</a>';
       } else if (b.block_type === 'code') {
         var codeText = b.extracted_content || b.raw_content || '';
-        if (codeText.length > 300) { codeText = codeText.substring(0, 300) + '...'; }
-        preview = '<pre class="mt-3 p-3 bg-surface-400/50 rounded-lg text-xs text-gray-300 overflow-x-auto border border-white/5 font-mono leading-relaxed max-h-32 overflow-y-auto">' + escapeHtml(codeText) + '</pre>';
+        preview = expandableBody(b.id, 'code', codeText, '<pre class="mt-3 p-3 bg-surface-400/50 rounded-lg text-xs text-gray-300 overflow-x-auto border border-white/5 font-mono leading-relaxed">', '</pre>');
+      } else if (b.block_type === 'pdf' || (b.file_path && b.block_type !== 'text')) {
+        preview = '<button onclick="window.openBlock(' + b.id + ')" class="mt-3 text-xs text-accent-400 hover:text-accent-300 font-medium">Open with default app</button>';
       }
 
       var extractedPreview = '';
-      if (b.extracted_content && b.block_type !== 'code') {
-        var et = b.extracted_content;
-        if (et.length > 180) { et = et.substring(0, 180) + '...'; }
-        extractedPreview = '<p class="mt-2 text-xs text-gray-500 leading-relaxed line-clamp-3">' + escapeHtml(et) + '</p>';
+      if (b.block_type !== 'code' && (b.extracted_content || (b.block_type === 'text' && b.raw_content))) {
+        var et = b.extracted_content || b.raw_content || '';
+        extractedPreview = expandableBody(b.id, 'text', et, '<p class="mt-2 text-xs text-gray-400 leading-relaxed">', '</p>');
       }
 
       var annotationBadge = '';
@@ -901,6 +927,12 @@ tailwind.config = {
             '</div>' +
           '</div>' +
           '<div class="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">' +
+            ((b.file_path || b.block_type === 'link') ? '<button onclick="window.openBlock(' + b.id + ')" class="p-1.5 rounded-lg hover:bg-accent-500/20 transition-colors" title="Open">' +
+              '<svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>' +
+            '</button>' : '') +
+            (b.file_path ? '<button onclick="window.downloadBlock(' + b.id + ')" class="p-1.5 rounded-lg hover:bg-accent-500/20 transition-colors" title="Download">' +
+              '<svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>' +
+            '</button>' : '') +
             '<button onclick="window.openSpaceModal(' + b.id + ')" class="p-1.5 rounded-lg hover:bg-accent-500/20 transition-colors" title="Move to space">' +
               '<svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>' +
             '</button>' +
@@ -939,6 +971,44 @@ tailwind.config = {
     if (diff < 604800) return Math.floor(diff / 86400) + 'd ago';
     return d.toLocaleDateString();
   }
+
+  function fileUrl(b, download) {
+    var u = '/api/file?path=' + encodeURIComponent(b.file_path);
+    if (b.file_name) u += '&name=' + encodeURIComponent(b.file_name);
+    if (download) u += '&download=1';
+    return u;
+  }
+
+  function isLongText(t) {
+    if (!t) return false;
+    return t.length > 220 || t.split('\n').length > 4;
+  }
+
+  function expandableBody(id, kind, full, openTag, closeTag) {
+    if (!full) return '';
+    var key = kind + '-' + id;
+    var long = isLongText(full);
+    var tag = openTag.replace(/class="/, 'id="body-' + key + '" class="' + (long ? 'line-clamp ' : ''));
+    return '<div>' + tag + escapeHtml(full) + closeTag +
+      (long ? '<button type="button" class="show-more-btn" id="btn-' + key + '" onclick="window.toggleText(\'' + key + '\')">Show more</button>' : '') +
+      '</div>';
+  }
+
+  window.toggleText = function(key) {
+    var el = document.getElementById('body-' + key);
+    var btn = document.getElementById('btn-' + key);
+    if (!el) return;
+    var expanded = el.getAttribute('data-expanded') === '1';
+    if (expanded) {
+      el.classList.add('line-clamp');
+      el.setAttribute('data-expanded', '0');
+      if (btn) btn.textContent = 'Show more';
+    } else {
+      el.classList.remove('line-clamp');
+      el.setAttribute('data-expanded', '1');
+      if (btn) btn.textContent = 'Show less';
+    }
+  };
 
   function formatBytes(bytes) {
     if (bytes === 0) return '0 B';
@@ -1050,6 +1120,34 @@ tailwind.config = {
     fetch('/api/blocks/delete?id=' + id, { method: 'DELETE' })
       .then(function() { showToast('Block deleted'); fetchBlocks(); })
       .catch(function(err) { showToast('Delete failed', 'error'); });
+  };
+
+  window.openBlock = function(id) {
+    var block = state.blocks.find(function(b) { return b.id === id; });
+    if (!block) return;
+    if (block.block_type === 'link' && block.raw_content) {
+      window.open(block.raw_content, '_blank', 'noopener');
+      return;
+    }
+    if (block.file_path) {
+      window.open(fileUrl(block, false), '_blank', 'noopener');
+      return;
+    }
+    showToast('Nothing to open');
+  };
+
+  window.downloadBlock = function(id) {
+    var block = state.blocks.find(function(b) { return b.id === id; });
+    if (!block || !block.file_path) {
+      showToast('No file to download', 'error');
+      return;
+    }
+    var a = document.createElement('a');
+    a.href = fileUrl(block, true);
+    a.download = block.file_name || 'download';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   };
 
   window.copyBlock = function(id) {

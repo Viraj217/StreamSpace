@@ -6,7 +6,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
+import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -345,11 +348,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
 
       final streamedResp = await request.send().timeout(
-            const Duration(seconds: 3),
+            const Duration(seconds: 60),
           );
       final resp = await http.Response.fromStream(streamedResp);
       if (resp.statusCode == 201 || resp.statusCode == 200) {
         _showSnack('Uploaded successfully');
+        _fetchBlocks();
       } else {
         throw Exception('Server returned ${resp.statusCode}');
       }
@@ -386,7 +390,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
 
         final streamedResp = await request.send().timeout(
-              const Duration(seconds: 5),
+              const Duration(seconds: 60),
             );
         if (streamedResp.statusCode == 201 || streamedResp.statusCode == 200) {
           await _offlineQueue.delete(key);
@@ -470,6 +474,176 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _wsReconnectTimer = Timer(const Duration(seconds: 4), _connectWebSocket);
   }
 
+  String _fileUrl(Map<String, dynamic> block, {bool download = false}) {
+    final filePath = (block['file_path'] ?? '').toString();
+    final fileName = (block['file_name'] ?? '').toString();
+    return Uri.parse('$baseUrl/api/file').replace(queryParameters: {
+      'path': filePath,
+      if (fileName.isNotEmpty) 'name': fileName,
+      if (download) 'download': '1',
+    }).toString();
+  }
+
+  Future<void> _openBlock(Map<String, dynamic> block) async {
+    final type = (block['block_type'] ?? 'text') as String;
+    final rawContent = (block['raw_content'] ?? '').toString().trim();
+    final filePath = (block['file_path'] ?? '').toString();
+    final fileName = (block['file_name'] ?? '').toString();
+    final mimeType = (block['mime_type'] ?? '').toString();
+    final id = block['id'] ?? 0;
+
+    if (type == 'link' ||
+        rawContent.startsWith('http://') ||
+        rawContent.startsWith('https://')) {
+      final uri = Uri.tryParse(rawContent);
+      if (uri == null) {
+        _showSnack('Invalid link');
+        return;
+      }
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) _showSnack('No app found to open this link');
+      return;
+    }
+
+    if (filePath.isEmpty) {
+      if (rawContent.isNotEmpty) {
+        await Clipboard.setData(ClipboardData(text: rawContent));
+        _showSnack('Copied to clipboard');
+      }
+      return;
+    }
+
+    _showSnack('Opening with default app...');
+    try {
+      final dir = await getTemporaryDirectory();
+      String ext = '';
+      if (fileName.contains('.')) {
+        ext = fileName.split('.').last;
+      } else if (filePath.contains('.')) {
+        ext = filePath.split('.').last;
+      }
+
+      var rawName = fileName.isNotEmpty ? fileName : 'file_$id';
+      var safeName = rawName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      if (!safeName.contains('.') && ext.isNotEmpty) {
+        safeName = '$safeName.$ext';
+      }
+
+      final local = File('${dir.path}/${id}_$safeName');
+      if (!await local.exists()) {
+        final resp = await http
+            .get(Uri.parse(_fileUrl(block)))
+            .timeout(const Duration(seconds: 45));
+        if (resp.statusCode != 200) {
+          _showSnack('Could not download file from server');
+          return;
+        }
+        await local.writeAsBytes(resp.bodyBytes, flush: true);
+      }
+
+      OpenResult result;
+      final cleanMime = (mimeType.isNotEmpty && mimeType != 'application/octet-stream')
+          ? mimeType
+          : null;
+
+      if (cleanMime != null) {
+        result = await OpenFilex.open(local.path, type: cleanMime);
+        if (result.type != ResultType.done) {
+          result = await OpenFilex.open(local.path);
+        }
+      } else {
+        result = await OpenFilex.open(local.path);
+      }
+
+      if (result.type != ResultType.done) {
+        try {
+          final uri = Uri.file(local.path);
+          final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+          if (!ok) {
+            _showSnack(result.message.isNotEmpty
+                ? result.message
+                : 'No app found to open this file');
+          }
+        } catch (_) {
+          _showSnack(result.message.isNotEmpty
+              ? result.message
+              : 'No app found to open this file');
+        }
+      }
+    } catch (e) {
+      debugPrint('Open block error: $e');
+      _showSnack('Could not open file: $e');
+    }
+  }
+
+  Future<void> _downloadBlock(Map<String, dynamic> block) async {
+    final filePath = (block['file_path'] ?? '').toString();
+    final fileName = (block['file_name'] ?? '').toString();
+    final id = block['id'] ?? 0;
+
+    if (filePath.isEmpty) {
+      _showSnack('No file to download');
+      return;
+    }
+
+    _showSnack('Downloading...');
+
+    // 1. Try launching with system downloader / default browser
+    try {
+      final dlUrl = _fileUrl(block, download: true);
+      final launched = await launchUrl(
+        Uri.parse(dlUrl),
+        mode: LaunchMode.externalApplication,
+      );
+      if (launched) {
+        _showSnack('Download started in default browser');
+        return;
+      }
+    } catch (_) {}
+
+    // 2. Fallback: download bytes and save to device
+    try {
+      final resp = await http
+          .get(Uri.parse(_fileUrl(block, download: true)))
+          .timeout(const Duration(seconds: 60));
+      if (resp.statusCode != 200) {
+        _showSnack('Download failed: server returned ${resp.statusCode}');
+        return;
+      }
+
+      Directory? saveDir;
+      try {
+        final publicDl = Directory('/storage/emulated/0/Download');
+        if (await publicDl.exists()) {
+          saveDir = publicDl;
+        }
+      } catch (_) {}
+
+      saveDir ??= await getExternalStorageDirectory() ??
+          await getApplicationDocumentsDirectory();
+
+      String ext = '';
+      if (fileName.contains('.')) {
+        ext = fileName.split('.').last;
+      } else if (filePath.contains('.')) {
+        ext = filePath.split('.').last;
+      }
+      var safeName = (fileName.isNotEmpty ? fileName : 'streamspace_$id')
+          .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      if (!safeName.contains('.') && ext.isNotEmpty) {
+        safeName = '$safeName.$ext';
+      }
+
+      final targetFile = File('${saveDir.path}/$safeName');
+      await targetFile.writeAsBytes(resp.bodyBytes, flush: true);
+
+      _showSnack('Saved: $safeName');
+    } catch (e) {
+      debugPrint('Download error: $e');
+      _showSnack('Download error: $e');
+    }
+  }
+
   Future<void> _deleteBlock(int id) async {
     try {
       final resp = await http
@@ -531,19 +705,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final type = (block['block_type'] ?? 'text') as String;
     final rawContent = (block['raw_content'] ?? '') as String;
     final fileName = (block['file_name'] ?? '') as String;
+    final filePath = (block['file_path'] ?? '') as String;
     final space = (block['space'] ?? 'Unfiled') as String;
     final extracted = (block['extracted_content'] ?? '') as String;
     final annotation = (block['annotation'] ?? '') as String;
     final id = (block['id'] ?? 0) as int;
     final fileSize = (block['file_size'] ?? 0);
     final createdAt = (block['created_at'] ?? '') as String;
+    final hasFile = filePath.isNotEmpty;
+    final isLink = type == 'link';
+    final isOpenable = hasFile || isLink;
 
     final displayTitle =
         fileName.isNotEmpty ? fileName : rawContent.split('\n').first;
-    final preview =
-        extracted.isNotEmpty ? extracted : rawContent;
-    final clippedPreview =
-        preview.length > 200 ? '${preview.substring(0, 200)}...' : preview;
+    final preview = extracted.isNotEmpty ? extracted : rawContent;
 
     final tColor = _typeColor(type);
 
@@ -594,12 +769,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         borderRadius: BorderRadius.circular(18),
         child: InkWell(
           borderRadius: BorderRadius.circular(18),
-          onTap: () {
-            if (rawContent.isNotEmpty) {
-              Clipboard.setData(ClipboardData(text: rawContent));
-              _showSnack('Copied to clipboard');
-            }
-          },
+          onTap: isOpenable ? () => _openBlock(block) : null,
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
@@ -689,9 +859,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           Clipboard.setData(
                               ClipboardData(text: rawContent));
                           _showSnack('Copied');
+                        } else if (val == 'open') {
+                          _openBlock(block);
+                        } else if (val == 'download') {
+                          _downloadBlock(block);
                         }
                       },
                       itemBuilder: (ctx) => [
+                        if (isOpenable)
+                          const PopupMenuItem(
+                            value: 'open',
+                            child: Row(
+                              children: [
+                                Icon(Icons.open_in_new_rounded,
+                                    size: 16, color: kAccentLight),
+                                SizedBox(width: 10),
+                                Text('Open',
+                                    style: TextStyle(fontSize: 13)),
+                              ],
+                            ),
+                          ),
+                        if (hasFile)
+                          const PopupMenuItem(
+                            value: 'download',
+                            child: Row(
+                              children: [
+                                Icon(Icons.download_rounded,
+                                    size: 16, color: kAccentLight),
+                                SizedBox(width: 10),
+                                Text('Download',
+                                    style: TextStyle(fontSize: 13)),
+                              ],
+                            ),
+                          ),
                         const PopupMenuItem(
                           value: 'copy',
                           child: Row(
@@ -739,19 +939,138 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                   ),
                 ),
-                if (clippedPreview.isNotEmpty &&
-                    type != 'link' &&
-                    clippedPreview != displayTitle) ...[
+                if (type == 'image' && hasFile) ...[
                   const SizedBox(height: 10),
-                  Text(
-                    clippedPreview,
+                  GestureDetector(
+                    onTap: () => _openBlock(block),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Stack(
+                        alignment: Alignment.bottomRight,
+                        children: [
+                          Image.network(
+                            _fileUrl(block),
+                            height: 180,
+                            width: double.infinity,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Container(
+                              height: 90,
+                              alignment: Alignment.center,
+                              color: Colors.white.withValues(alpha: 0.03),
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(Icons.broken_image_rounded,
+                                      size: 24, color: Colors.grey.shade600),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Tap to open image',
+                                    style: TextStyle(
+                                        fontSize: 12, color: Colors.grey.shade500),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          Container(
+                            margin: const EdgeInsets.all(8),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.65),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.fullscreen_rounded,
+                                    size: 14, color: Colors.white),
+                                SizedBox(width: 4),
+                                Text(
+                                  'Tap to view',
+                                  style: TextStyle(
+                                      fontSize: 10,
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w500),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                if (hasFile) ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                          label: const Text(
+                            'Open',
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: kAccentLight,
+                            side: BorderSide(
+                                color: kAccent.withValues(alpha: 0.35)),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () => _openBlock(block),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          icon: const Icon(Icons.download_rounded, size: 14),
+                          label: const Text(
+                            'Download',
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            side: BorderSide(
+                                color: Colors.white.withValues(alpha: 0.15)),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () => _downloadBlock(block),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                if (preview.isNotEmpty && type != 'link' && type != 'image') ...[
+                  const SizedBox(height: 10),
+                  ExpandableText(
+                    text: preview,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.grey.shade400,
+                      height: 1.45,
+                    ),
+                    collapsedLines: 4,
+                  ),
+                ],
+                if (type == 'image' && extracted.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  ExpandableText(
+                    text: extracted,
                     style: TextStyle(
                       fontSize: 12,
                       color: Colors.grey.shade500,
-                      height: 1.5,
+                      height: 1.45,
                     ),
-                    maxLines: 4,
-                    overflow: TextOverflow.ellipsis,
+                    collapsedLines: 4,
                   ),
                 ],
                 if (type == 'link') ...[
@@ -1067,3 +1386,123 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 }
+
+class ExpandableText extends StatefulWidget {
+  final String text;
+  final TextStyle? style;
+  final int collapsedLines;
+  final int characterLimit;
+
+  const ExpandableText({
+    super.key,
+    required this.text,
+    this.style,
+    this.collapsedLines = 4,
+    this.characterLimit = 180,
+  });
+
+  @override
+  State<ExpandableText> createState() => _ExpandableTextState();
+}
+
+class _ExpandableTextState extends State<ExpandableText> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final effectiveStyle = widget.style ??
+        TextStyle(
+          fontSize: 13,
+          color: Colors.grey.shade300,
+          height: 1.45,
+        );
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final text = widget.text;
+        final hasNewlineOverflow =
+            text.split('\n').length > widget.collapsedLines;
+        final hasCharOverflow = text.length > widget.characterLimit;
+
+        // Measure with TextPainter to detect horizontal wrapping overflow
+        final textSpan = TextSpan(text: text, style: effectiveStyle);
+        final textPainter = TextPainter(
+          text: textSpan,
+          maxLines: widget.collapsedLines,
+          textDirection: Directionality.maybeOf(context) ?? TextDirection.ltr,
+        )..layout(
+            maxWidth: constraints.maxWidth > 0
+                ? constraints.maxWidth
+                : double.infinity,
+          );
+
+        final isOverflowing = textPainter.didExceedMaxLines ||
+            hasNewlineOverflow ||
+            hasCharOverflow;
+
+        if (!isOverflowing) {
+          return SelectableText(
+            text,
+            style: effectiveStyle,
+          );
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            InkWell(
+              onTap: () => setState(() => _expanded = !_expanded),
+              splashColor: Colors.transparent,
+              highlightColor: Colors.transparent,
+              child: AnimatedCrossFade(
+                firstChild: Text(
+                  text,
+                  style: effectiveStyle,
+                  maxLines: widget.collapsedLines,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                secondChild: SelectableText(
+                  text,
+                  style: effectiveStyle,
+                ),
+                crossFadeState: _expanded
+                    ? CrossFadeState.showSecond
+                    : CrossFadeState.showFirst,
+                duration: const Duration(milliseconds: 200),
+              ),
+            ),
+            const SizedBox(height: 4),
+            GestureDetector(
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _expanded ? 'Show less' : 'Read more',
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: kAccentLight,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(
+                      _expanded
+                          ? Icons.keyboard_arrow_up_rounded
+                          : Icons.keyboard_arrow_down_rounded,
+                      size: 16,
+                      color: kAccentLight,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
