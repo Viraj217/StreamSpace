@@ -1,0 +1,40 @@
+# Compiled binaries & executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+streamspace
+streamspace.exe
+test_fts.exe
+
+# Local data & uploads (SQLite DB and uploaded user files)
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Dart & Flutter
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android build outputs & local properties
+android/.gradle/
+android/captures/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/GeneratedPluginRegistrant.java
+android/app/build/
+*.apk
+*.aab
+
+# Editor & OS files
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
